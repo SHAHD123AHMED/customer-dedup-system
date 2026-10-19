@@ -1,0 +1,6 @@
+db_url.txt
+*.db
+__pycache__/
+old_learning_files/
+customers.csv
+new_batch.csv
