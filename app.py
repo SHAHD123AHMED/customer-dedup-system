@@ -1,116 +1,46 @@
-# وظيفته: صفحة ويب فيها فورم تسجيل عميل + خدمة بترد فوراً (نفس منطق الحارس)
-from flask import Flask, request, jsonify
+# وظيفته: صفحة ويب فيها فورم تسجيل عميل + خدمة بترد فوراً.
+# بيستخدم نفس منطق dedup.py اللي بيستخدمه main.py.
+import os
 import psycopg2
-import psycopg2.errors
+from flask import Flask, request, jsonify
+from dedup import ensure_tables, process_record
 
 app = Flask(__name__)
 
-import os
-
-DB_URL = os.environ.get("DB_URL")          # على السحابة: من إعدادات المنصة
-if not DB_URL:                             # على جهازك: من الملف
+DB_URL = os.environ.get("DATABASE_URL") or os.environ.get("DB_URL")  # على السحابة
+if not DB_URL:                                                       # على جهازك
     with open("db_url.txt") as f:
         DB_URL = f.read().strip()
+
+MESSAGES = {
+    "accepted": "تم التسجيل بنجاح. أهلاً بيك!",
+    "duplicate": "البيانات دي مسجّلة عندنا قبل كده.",
+    "invalid": "البيانات غير صحيحة: اكتب الاسم وإيميل صحيح وموبايل مصري من 11 رقم.",
+    "review": "فيه تشابه مع بيانات مسجّلة. هنراجع بياناتك ونرد عليك.",
+}
 
 
 def get_connection():
     return psycopg2.connect(DB_URL)
 
 
-def create_tables():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS customers (
-            id SERIAL PRIMARY KEY,
-            full_name TEXT, email TEXT UNIQUE, phone TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS rejected_records (
-            id SERIAL PRIMARY KEY,
-            full_name TEXT, email TEXT, phone TEXT, reason TEXT,
-            UNIQUE (full_name, email, phone, reason)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS review_queue (
-            id SERIAL PRIMARY KEY,
-            full_name TEXT, email TEXT UNIQUE, phone TEXT, reason TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def normalize_email(email):
-    return email.strip().lower()
-
-
-def normalize_phone(phone):
-    return "".join(ch for ch in phone if ch.isdigit())
-
-
-def is_valid(name, email):
-    if name.strip() == "":
-        return False
-    if "@" not in email or "." not in email:
-        return False
-    return True
-
-
 def process(name, email, phone):
-    """نفس منطق الحارس. بيرجّع (الحالة، الرسالة)."""
-    name = name.strip()
-    email = normalize_email(email)
-    phone = normalize_phone(phone)
-
     conn = get_connection()
     cur = conn.cursor()
     try:
-        # 1) صلاحية
-        if not is_valid(name, email):
-            cur.execute(
-                "INSERT INTO rejected_records (full_name, email, phone, reason) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (name, email, phone, "invalid"))
-            conn.commit()
-            return "invalid", "البيانات غير صحيحة: اكتب الاسم وإيميل صحيح."
-
-        # 2) نفس الإيميل؟ مكرر مؤكد
-        cur.execute("SELECT 1 FROM customers WHERE email = %s", (email,))
-        if cur.fetchone():
-            cur.execute(
-                "INSERT INTO rejected_records (full_name, email, phone, reason) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (name, email, phone, "duplicate"))
-            conn.commit()
-            return "duplicate", "الإيميل ده مسجّل عندنا قبل كده."
-
-        # 3) نفس التليفون بإيميل مختلف؟ راجعني
-        if phone:
-            cur.execute("SELECT 1 FROM customers WHERE phone = %s", (phone,))
-            if cur.fetchone():
-                cur.execute(
-                    "INSERT INTO review_queue (full_name, email, phone, reason) "
-                    "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                    (name, email, phone, "same_phone_different_email"))
-                conn.commit()
-                return "review", "رقم التليفون ده مسجّل بإيميل تاني. هنراجع بياناتك ونرد عليك."
-
-        # 4) جديد: يتسجل
-        try:
-            cur.execute(
-                "INSERT INTO customers (full_name, email, phone) VALUES (%s, %s, %s)",
-                (name, email, phone))
-            conn.commit()
-            return "accepted", "تم التسجيل بنجاح. أهلاً بيك!"
-        except psycopg2.errors.UniqueViolation:
-            # لو حد سجّل نفس الإيميل في نفس اللحظة، القاعدة نفسها بتمنعه
-            conn.rollback()
-            return "duplicate", "الإيميل ده مسجّل عندنا قبل كده."
+        status, _ = process_record(cur, name, email, phone)
+        conn.commit()
+        return status, MESSAGES[status]
     finally:
         conn.close()
+
+
+def create_tables():
+    conn = get_connection()
+    cur = conn.cursor()
+    ensure_tables(cur)
+    conn.commit()
+    conn.close()
 
 
 PAGE = """
@@ -180,7 +110,7 @@ def home():
 
 @app.route("/submit", methods=["POST"])
 def submit():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     status, message = process(
         data.get("name", ""), data.get("email", ""), data.get("phone", ""))
     return jsonify({"status": status, "message": message})
