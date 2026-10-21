@@ -1,112 +1,52 @@
-# وظيفته: الحارس. يقرأ ملف CSV، يصنّف كل سجل، ويحفظه في القاعدة السحابية
-#   accepted -> جدول customers
-#   duplicate / invalid -> جدول rejected_records
-#   needs review -> جدول review_queue
+# وظيفته: الحارس لملفات CSV. يقرأ الملف، يمرر كل سجل على dedup.process_record،
+# ويطبع ملخص. (قواعد التصنيف نفسها في dedup.py)
 # التشغيل العادي: بياخد customers.csv
-# أو تكتب اسم ملف تاني: main.py new_batch.csv
+# أو تكتب اسم ملف تاني: python main.py new_batch.csv
 import csv
+import os
 import sys
 import psycopg2
+from dedup import ensure_tables, process_record
 
-def normalize_email(email):
-    return email.strip().lower()
 
-def normalize_phone(phone):
-    return "".join(ch for ch in phone if ch.isdigit())
+def get_db_url():
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        return url
+    with open("db_url.txt") as f:
+        return f.read().strip()
 
-def is_valid(name, email):
-    if name.strip() == "":
-        return False
-    if "@" not in email or "." not in email:
-        return False
-    return True
 
-input_file = sys.argv[1] if len(sys.argv) > 1 else "customers.csv"
+if __name__ == "__main__":
+    input_file = sys.argv[1] if len(sys.argv) > 1 else "customers.csv"
 
-with open("db_url.txt") as f:
-    db_url = f.read().strip()
+    conn = psycopg2.connect(get_db_url())
+    cur = conn.cursor()
+    ensure_tables(cur)
+    conn.commit()
 
-conn = psycopg2.connect(db_url)
-cur = conn.cursor()
+    counts = {"accepted": 0, "duplicate": 0, "invalid": 0, "review": 0}
+    total = 0
 
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS customers (
-        id SERIAL PRIMARY KEY,
-        full_name TEXT,
-        email TEXT UNIQUE,
-        phone TEXT
-    )
-""")
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS rejected_records (
-        id SERIAL PRIMARY KEY,
-        full_name TEXT, email TEXT, phone TEXT, reason TEXT,
-        UNIQUE (full_name, email, phone, reason)
-    )
-""")
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS review_queue (
-        id SERIAL PRIMARY KEY,
-        full_name TEXT, email TEXT UNIQUE, phone TEXT, reason TEXT
-    )
-""")
-conn.commit()
+    with open(input_file, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            total += 1
+            status, _ = process_record(
+                cur, row["full_name"], row["email"], row["phone"])
+            counts[status] += 1
 
-accepted = duplicates = invalid = review = 0
+    conn.commit()
 
-with open(input_file, encoding="utf-8") as f:
-    for row in csv.DictReader(f):
-        name = row["full_name"].strip()
-        email = normalize_email(row["email"])
-        phone = normalize_phone(row["phone"])
+    print("File      :", input_file)
+    print("Total     :", total)
+    print("Accepted  :", counts["accepted"])
+    print("Duplicates:", counts["duplicate"])
+    print("Invalid   :", counts["invalid"])
+    print("Review    :", counts["review"])
+    print()
+    print("--- Rows now in CLOUD database ---")
+    for table in ["customers", "rejected_records", "review_queue"]:
+        cur.execute("SELECT COUNT(*) FROM " + table)
+        print(table, ":", cur.fetchone()[0])
 
-        # 1) صلاحية
-        if not is_valid(name, email):
-            invalid += 1
-            cur.execute(
-                "INSERT INTO rejected_records (full_name, email, phone, reason) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (name, email, phone, "invalid"))
-            continue
-
-        # 2) نفس الإيميل؟ مكرر مؤكد
-        cur.execute("SELECT 1 FROM customers WHERE email = %s", (email,))
-        if cur.fetchone():
-            duplicates += 1
-            cur.execute(
-                "INSERT INTO rejected_records (full_name, email, phone, reason) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (name, email, phone, "duplicate"))
-            continue
-
-        # 3) نفس التليفون بإيميل مختلف؟ راجعني
-        if phone:
-            cur.execute("SELECT 1 FROM customers WHERE phone = %s", (phone,))
-            if cur.fetchone():
-                review += 1
-                cur.execute(
-                    "INSERT INTO review_queue (full_name, email, phone, reason) "
-                    "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                    (name, email, phone, "same_phone_different_email"))
-                continue
-
-        # 4) جديد: يتقبل
-        cur.execute(
-            "INSERT INTO customers (full_name, email, phone) VALUES (%s, %s, %s)",
-            (name, email, phone))
-        accepted += 1
-
-conn.commit()
-
-print("File      :", input_file)
-print("Accepted  :", accepted)
-print("Duplicates:", duplicates)
-print("Invalid   :", invalid)
-print("Review    :", review)
-print()
-print("--- Rows now in CLOUD database ---")
-for table in ["customers", "rejected_records", "review_queue"]:
-    cur.execute("SELECT COUNT(*) FROM " + table)
-    print(table, ":", cur.fetchone()[0])
-
-conn.close()
+    conn.close()
